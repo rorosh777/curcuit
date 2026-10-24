@@ -82,7 +82,11 @@ PRD 14.1의 권장 순서. 한 단계를 끝낼 때마다 데스크톱과 태블
 | 2026-10-24 | 새 세션: 문서 4종(PRD, README, current_status, CLAUDE.md)을 읽고 이해한 내용을 사용자에게 요약 보고. 코드 변경 없음 |
 | 2026-10-24 | 사용자 확정: 전선 총 3개, 불량은 종류별 1개 고정·식별자 무작위, 대상 중학교. 구현 1단계 완료: `index.html`에 CircuitCore(데이터 모델, `createSession`, 순수 `evaluateCircuit`)와 `#selftest` 자체 검사 31개(AT01, AT13~AT20, 288가지 전체 조합 포함). 헤드리스 Edge에서 31/31 통과, 일부러 버그를 넣으면 실패하는 것도 확인 |
 
+| 2026-10-24 | 개발 계획(0~7단계) 합의. 0단계: 1단계 결과를 main에 커밋(7286ca8). 푸시는 이 환경에 GitHub 로그인이 없어 실패 → 사용자가 VS Code 또는 GitHub Desktop으로 푸시하고 Pages를 켜야 함 |
+
 ## 8. 다음 액션
+
+0. (0단계) 사용자가 커밋 7286ca8을 푸시하고 GitHub Settings → Pages에서 main / root로 배포를 켠다. 주소: https://rorosh777.github.io/curcuit/
 
 1. 사용자가 데스크톱(Chrome·Edge)과 아이패드 Safari에서 `index.html#selftest`를 열어 "모두 통과"인지 확인한다.
 2. 확인되면 구현 2단계(부품 배치, 전선 끝점 스냅, 연결 그래프 동기화, AT03~AT05)를 시작한다.
