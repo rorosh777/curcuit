@@ -1,0 +1,593 @@
+<!doctype html>
+<!--
+  전기회로 검사기 (circuit) — 단일 파일 웹앱
+
+  [실행 방법]
+  - 이 파일을 브라우저(Chrome, Edge, Safari)로 열면 됩니다. 설치할 것은 없습니다.
+  - 배포: GitHub 저장소 Settings → Pages에서 배포 브랜치(main, /root)를 지정하고 안내된 주소를 학생에게 공유합니다.
+  - 로그인이 없으므로 관리자 지정은 필요 없습니다.
+
+  [판정 자체 검사]
+  - 주소 끝에 #selftest 를 붙여 열면(예: index.html#selftest) 회로 판정 조합 테스트가 실행되고 결과 표가 나옵니다.
+  - 지원 브라우저마다 열어 "모두 통과"인지 확인합니다 (PRD 16.1: 지원 브라우저에서 판정 결과 동일).
+
+  [개인정보]
+  - 활동 상태를 서버, localStorage, sessionStorage, IndexedDB, 쿠키 어디에도 저장하지 않습니다. 새로고침하면 새 세션입니다.
+
+  [진행 상태]
+  - 1단계: 부품·단자 데이터 모델과 순수 회로 판정 함수. 화면 조작은 다음 단계에서 만듭니다.
+-->
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>전기회로 검사기</title>
+<style>
+  :root { color-scheme: light; --ink: #1f2933; --muted: #52606d; --line: #cbd2d9; --ok: #1e6b3a; --bad: #a3221b; }
+  body { margin: 0; padding: 24px 16px; font: 16px/1.6 system-ui, -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; color: var(--ink); background: #fff; }
+  main { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 8px; }
+  p { margin: 0 0 12px; }
+  .muted { color: var(--muted); }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+  th, td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #f5f7fa; }
+  .pass { color: var(--ok); font-weight: 700; }
+  .fail { color: var(--bad); font-weight: 700; }
+</style>
+</head>
+<body>
+
+<main id="app">
+  <h1>전기회로 검사기</h1>
+  <p>전지, 전구, 소켓, 전선으로 회로를 만들고 세 번의 검사로 전구가 켜지지 않는 원인을 찾아보는 활동입니다.</p>
+  <p class="muted">지금은 준비 중입니다. 회로 판정 기능까지 만들었고, 화면 조작은 다음 단계에서 추가됩니다.</p>
+</main>
+
+<main id="selftest" hidden>
+  <h1>회로 판정 자체 검사</h1>
+  <p id="selftest-summary" role="status"></p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>번호</th><th>검사 항목</th><th>결과</th><th>내용</th></tr></thead>
+      <tbody id="selftest-rows"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+/* =====================================================================
+   CircuitCore — 부품 데이터 모델과 회로 판정 (화면과 분리된 순수 로직)
+   - 화면(DOM)에 접근하지 않는다. 그래서 자체 검사로 판정 조합을 자동 확인할 수 있다.
+   - 불량 여부(condition)는 이 메모리 상태에만 있고, DOM 속성·라벨로 내보내지 않는다 (D10).
+   ===================================================================== */
+const CircuitCore = (function () {
+  "use strict";
+
+  const TYPE = Object.freeze({ BATTERY: "battery", BULB: "bulb", SOCKET: "socket", WIRE: "wire" });
+  const CONDITION = Object.freeze({ NORMAL: "normal", FAULTY: "faulty" });
+  // 세션 단계 (D03, 8.1 상태 전이). 전이 규칙은 4단계에서 만든다.
+  const PHASE = Object.freeze({
+    INTRO: "intro", GUIDE: "guide", BUILD: "build", RESULT: "result", SENTENCE: "sentence", DONE: "done"
+  });
+  // 판정 결과 이유. OK만 유효 검사이며 검사 횟수를 쓴다 (D20).
+  const REASON = Object.freeze({
+    OK: "ok",
+    SHORT: "short_circuit",            // 전지 양극과 음극이 전선만으로 이어짐 (E05)
+    NO_BULB: "no_bulb",                // 소켓에 전구가 없음 (E02)
+    OPEN: "open_circuit",              // 전지 두 극이 소켓의 서로 다른 단자까지 이어지지 않음 (E01)
+    MULTIPLE_BATTERIES: "multiple_batteries" // 전지 두 개가 동시에 회로에 들어감 (회로에 쓰는 전지는 한 개)
+  });
+  const MAX_INSPECTIONS = 3;
+  const SOCKET_ID = "socket";
+
+  // 세션마다 같은 식별자로 만드는 부품 목록. 어느 부품이 불량인지만 세션마다 무작위로 정한다.
+  const PART_SPECS = Object.freeze([
+    { id: "battery-A", type: TYPE.BATTERY, label: "전지 A" },
+    { id: "battery-B", type: TYPE.BATTERY, label: "전지 B" },
+    { id: "bulb-A", type: TYPE.BULB, label: "전구 A" },
+    { id: "bulb-B", type: TYPE.BULB, label: "전구 B" },
+    { id: SOCKET_ID, type: TYPE.SOCKET, label: "소켓" },
+    { id: "wire-1", type: TYPE.WIRE, label: "전선 1" },
+    { id: "wire-2", type: TYPE.WIRE, label: "전선 2" },
+    { id: "wire-3", type: TYPE.WIRE, label: "전선 3" }
+  ].map(Object.freeze));
+
+  // 종류별로 정확히 한 개씩 불량 (D06). 소켓은 항상 정상 (D07).
+  const FAULTY_TYPES = Object.freeze([TYPE.BATTERY, TYPE.BULB, TYPE.WIRE]);
+
+  // 단자 식별자: 전지는 "<id>:pos", "<id>:neg", 소켓은 "socket:1", "socket:2"
+  function terminalId(ownerId, name) {
+    return ownerId + ":" + name;
+  }
+
+  // 0 이상 n 미만의 정수. 가능하면 crypto를 쓴다.
+  function defaultRandomInt(n) {
+    if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+      return Math.floor(crypto.getRandomValues(new Uint32Array(1))[0] / 4294967296 * n);
+    }
+    return Math.floor(Math.random() * n);
+  }
+
+  function specsOfType(type) {
+    return PART_SPECS.filter(function (spec) { return spec.type === type; });
+  }
+
+  function pickFaultyIds(randomInt) {
+    return FAULTY_TYPES.map(function (type) {
+      const candidates = specsOfType(type);
+      const index = randomInt(candidates.length);
+      if (!Number.isInteger(index) || index < 0 || index >= candidates.length) {
+        throw new Error("무작위 값이 범위를 벗어났습니다: " + index);
+      }
+      return candidates[index].id;
+    });
+  }
+
+  // 테스트에서 불량 부품을 직접 지정할 때 쓰는 값의 형식을 확인한다.
+  function checkFaultyIds(faultyIds) {
+    FAULTY_TYPES.forEach(function (type) {
+      const ids = specsOfType(type).map(function (spec) { return spec.id; });
+      const count = faultyIds.filter(function (id) { return ids.indexOf(id) !== -1; }).length;
+      if (count !== 1) throw new Error(type + " 종류의 불량 부품은 정확히 한 개여야 합니다.");
+    });
+    if (faultyIds.length !== FAULTY_TYPES.length) throw new Error("불량 부품 지정이 잘못되었습니다.");
+    return faultyIds.slice();
+  }
+
+  /**
+   * 새 세션 상태를 만든다 (FR002). 메모리에서만 유지하고 어디에도 저장하지 않는다.
+   * options.faultyIds: 불량 부품 식별자 배열 (테스트용). 없으면 무작위로 배정한다.
+   * options.randomInt: 무작위 함수 (테스트용). randomInt(n)은 0..n-1을 돌려준다.
+   *
+   * 연결 정보는 전선의 endpointA/endpointB(단자 식별자 또는 null) 한 곳에만 둔다.
+   * PRD의 Terminal.connectionId는 여기서 계산해 얻으므로 따로 저장하지 않는다 (두 곳이 어긋나지 않게).
+   */
+  function createSession(options) {
+    const opts = options || {};
+    const faultyIds = opts.faultyIds
+      ? checkFaultyIds(opts.faultyIds)
+      : pickFaultyIds(opts.randomInt || defaultRandomInt);
+
+    const components = {};
+    const wires = {};
+    const terminals = {};
+
+    PART_SPECS.forEach(function (spec) {
+      const condition = faultyIds.indexOf(spec.id) !== -1 ? CONDITION.FAULTY : CONDITION.NORMAL;
+      if (spec.type === TYPE.WIRE) {
+        wires[spec.id] = { id: spec.id, label: spec.label, condition: condition, endpointA: null, endpointB: null };
+        return;
+      }
+      // position이 null이면 부품 상자 안에 있다.
+      const component = { id: spec.id, type: spec.type, label: spec.label, condition: condition, position: null };
+      if (spec.type === TYPE.SOCKET) component.mountedBulbId = null;
+      components[spec.id] = component;
+    });
+
+    Object.keys(components).forEach(function (id) {
+      const type = components[id].type;
+      if (type === TYPE.BATTERY) {
+        terminals[terminalId(id, "pos")] = { id: terminalId(id, "pos"), ownerId: id, polarity: "positive" };
+        terminals[terminalId(id, "neg")] = { id: terminalId(id, "neg"), ownerId: id, polarity: "negative" };
+      } else if (type === TYPE.SOCKET) {
+        // 소켓 단자는 극성이 없다. 전지 두 극이 서로 다른 소켓 단자에 이어지기만 하면 된다 (7.2).
+        terminals[terminalId(id, "1")] = { id: terminalId(id, "1"), ownerId: id, polarity: null };
+        terminals[terminalId(id, "2")] = { id: terminalId(id, "2"), ownerId: id, polarity: null };
+      }
+    });
+
+    return {
+      phase: PHASE.INTRO,
+      inspectionCount: 0,
+      completed: false,
+      components: components,
+      wires: wires,
+      terminals: terminals,
+      inspections: [] // { sequence, circuitValid, lampOn } — 화면 표시용, 저장하지 않음
+    };
+  }
+
+  // 두 끝이 모두 단자에 붙은 전선만 그래프의 간선이 된다 (7.3의 2번, 6.2의 5번).
+  function fullyConnectedWires(state) {
+    return Object.keys(state.wires).map(function (id) { return state.wires[id]; }).filter(function (wire) {
+      if (wire.endpointA === null || wire.endpointB === null) return false;
+      [wire.endpointA, wire.endpointB].forEach(function (t) {
+        if (!state.terminals[t]) throw new Error("알 수 없는 단자입니다: " + t);
+      });
+      return wire.endpointA !== wire.endpointB;
+    });
+  }
+
+  // 단자를 꼭짓점, 전선을 간선으로 하는 연결 그래프
+  function buildGraph(wireList) {
+    const graph = new Map();
+    function link(from, to) {
+      if (!graph.has(from)) graph.set(from, []);
+      graph.get(from).push(to);
+    }
+    wireList.forEach(function (wire) {
+      link(wire.endpointA, wire.endpointB);
+      link(wire.endpointB, wire.endpointA);
+    });
+    return graph;
+  }
+
+  // start 단자에서 전선만 따라가 닿는 단자 집합. 부품 내부(전지 안, 소켓 안의 전구)는 지나가지 않는다.
+  function reachable(graph, start) {
+    const seen = new Set([start]);
+    const queue = [start];
+    while (queue.length) {
+      const node = queue.shift();
+      (graph.get(node) || []).forEach(function (next) {
+        if (!seen.has(next)) { seen.add(next); queue.push(next); }
+      });
+    }
+    return seen;
+  }
+
+  // 전지의 양극과 음극이 소켓의 서로 다른 두 단자에 각각 이어지는가 (극성 방향은 상관없음)
+  function spansSocket(graph, batteryId) {
+    const fromPos = reachable(graph, terminalId(batteryId, "pos"));
+    const fromNeg = reachable(graph, terminalId(batteryId, "neg"));
+    const s1 = terminalId(SOCKET_ID, "1");
+    const s2 = terminalId(SOCKET_ID, "2");
+    return (fromPos.has(s1) && fromNeg.has(s2)) || (fromPos.has(s2) && fromNeg.has(s1));
+  }
+
+  /**
+   * 회로를 판정한다 (7장). 입력 상태를 바꾸지 않는 순수 함수다.
+   * 반환값:
+   *   valid           유효 폐회로인가. true일 때만 검사 횟수를 쓴다.
+   *   reason          REASON 값. 여러 문제가 겹치면 단락 → 전구 없음 → 개방 → 전지 두 개 순으로 하나만 알린다.
+   *   lampOn          유효 회로일 때 전구가 켜지는가. 유효하지 않으면 null.
+   *   danglingWireIds 한쪽 끝만 연결된 전선 (E01에서 강조할 대상)
+   * 어떤 부품이 불량인지는 돌려주지 않는다 (8.2: 불량 부품을 자동으로 알려 주지 않음).
+   */
+  function evaluateCircuit(state) {
+    const socket = state.components[SOCKET_ID];
+    const batteryIds = Object.keys(state.components).filter(function (id) {
+      return state.components[id].type === TYPE.BATTERY;
+    });
+    const danglingWireIds = Object.keys(state.wires).filter(function (id) {
+      const wire = state.wires[id];
+      return (wire.endpointA === null) !== (wire.endpointB === null);
+    });
+    function invalid(reason) {
+      return { valid: false, reason: reason, lampOn: null, danglingWireIds: danglingWireIds };
+    }
+
+    const wireList = fullyConnectedWires(state);
+    const graph = buildGraph(wireList);
+
+    // 1) 단락: 어느 전지든 양극에서 전선만으로 음극에 닿으면 위험 회로 (7.3의 4번)
+    const shorted = batteryIds.some(function (id) {
+      return reachable(graph, terminalId(id, "pos")).has(terminalId(id, "neg"));
+    });
+    if (shorted) return invalid(REASON.SHORT);
+
+    // 2) 소켓에 전구가 장착되어야 한다 (D12)
+    if (socket.mountedBulbId === null) return invalid(REASON.NO_BULB);
+    const bulb = state.components[socket.mountedBulbId];
+    if (!bulb || bulb.type !== TYPE.BULB) throw new Error("소켓에 장착된 부품이 전구가 아닙니다: " + socket.mountedBulbId);
+
+    // 3) 전지 한 개의 두 극이 소켓의 서로 다른 단자까지 전선으로 이어져야 한다 (7.1)
+    const spanning = batteryIds.filter(function (id) { return spansSocket(graph, id); });
+    if (spanning.length === 0) return invalid(REASON.OPEN);
+    if (spanning.length > 1) return invalid(REASON.MULTIPLE_BATTERIES);
+
+    // 4) 점등: 전지·전구가 정상이고, 불량 전선을 빼도 같은 연결이 남아야 한다.
+    //    불량 전선은 전류가 흐르지 않는 것으로 본다 (D18). 경로 밖의 불량 전선은 영향이 없다.
+    const battery = state.components[spanning[0]];
+    const normalGraph = buildGraph(wireList.filter(function (wire) { return wire.condition === CONDITION.NORMAL; }));
+    const lampOn = battery.condition === CONDITION.NORMAL &&
+      bulb.condition === CONDITION.NORMAL &&
+      spansSocket(normalGraph, battery.id);
+
+    return { valid: true, reason: REASON.OK, lampOn: lampOn, danglingWireIds: danglingWireIds };
+  }
+
+  return Object.freeze({
+    TYPE: TYPE,
+    CONDITION: CONDITION,
+    PHASE: PHASE,
+    REASON: REASON,
+    MAX_INSPECTIONS: MAX_INSPECTIONS,
+    SOCKET_ID: SOCKET_ID,
+    PART_SPECS: PART_SPECS,
+    terminalId: terminalId,
+    createSession: createSession,
+    evaluateCircuit: evaluateCircuit
+  });
+})();
+</script>
+
+<script>
+/* =====================================================================
+   자체 검사 — 주소에 #selftest 가 있을 때만 실행 (AT01, AT13~AT20과 판정 조합 전체)
+   ===================================================================== */
+(function () {
+  "use strict";
+  const C = CircuitCore;
+  const R = C.REASON;
+  const T = C.terminalId;
+  const S1 = T(C.SOCKET_ID, "1");
+  const S2 = T(C.SOCKET_ID, "2");
+  // 기본 불량 배정: 전지 B, 전구 B, 전선 3 → 전지 A, 전구 A, 전선 1·2는 정상
+  const DEFAULT_FAULTY = ["battery-B", "bulb-B", "wire-3"];
+
+  function idsOfType(type) {
+    return C.PART_SPECS.filter(function (s) { return s.type === type; }).map(function (s) { return s.id; });
+  }
+
+  // 테스트용 회로: links는 [전선, 끝점A 단자, 끝점B 단자] 목록, bulbId는 소켓에 끼울 전구(null이면 빈 소켓)
+  function build(links, bulbId, faultyIds) {
+    const state = C.createSession({ faultyIds: faultyIds || DEFAULT_FAULTY });
+    links.forEach(function (link) {
+      state.wires[link[0]].endpointA = link[1];
+      state.wires[link[0]].endpointB = link[2];
+    });
+    state.components[C.SOCKET_ID].mountedBulbId = bulbId === undefined ? "bulb-A" : bulbId;
+    return state;
+  }
+  function basicLinks(batteryId, wireX, wireY) {
+    return [[wireX, T(batteryId, "pos"), S1], [wireY, T(batteryId, "neg"), S2]];
+  }
+
+  function assertEqual(actual, expected, what) {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new Error(what + ": 기대 " + JSON.stringify(expected) + ", 실제 " + JSON.stringify(actual));
+    }
+  }
+  function assertThrows(fn, what) {
+    let threw = false;
+    try { fn(); } catch (e) { threw = true; }
+    if (!threw) throw new Error(what + ": 오류가 나야 하는데 나지 않았습니다.");
+  }
+  // 검사 횟수 차감 여부는 valid로 정해진다 (valid일 때만 1 증가).
+  function expectResult(state, expected) {
+    const result = C.evaluateCircuit(state);
+    assertEqual(result.valid, expected.valid, "유효 회로(검사 횟수 차감) 여부");
+    assertEqual(result.reason, expected.reason, "판정 이유");
+    assertEqual(result.lampOn, expected.lampOn, "점등 여부");
+    if (expected.danglingWireIds) assertEqual(result.danglingWireIds, expected.danglingWireIds, "한쪽만 연결된 전선");
+  }
+  const ON = { valid: true, reason: R.OK, lampOn: true };
+  const OFF = { valid: true, reason: R.OK, lampOn: false };
+
+  const tests = [];
+  function test(id, name, fn) { tests.push({ id: id, name: name, fn: fn }); }
+
+  // ---------- 세션과 부품 데이터 ----------
+  test("AT01", "새 세션: 전지 2, 전구 2, 소켓 1, 전선 3, 종류별 불량 1개", function () {
+    const s = C.createSession();
+    const comps = Object.keys(s.components).map(function (id) { return s.components[id]; });
+    function count(type, cond) {
+      return comps.filter(function (c) { return c.type === type && (!cond || c.condition === cond); }).length;
+    }
+    const wires = Object.keys(s.wires).map(function (id) { return s.wires[id]; });
+    assertEqual(count(C.TYPE.BATTERY), 2, "전지 수");
+    assertEqual(count(C.TYPE.BULB), 2, "전구 수");
+    assertEqual(count(C.TYPE.SOCKET), 1, "소켓 수");
+    assertEqual(wires.length, 3, "전선 수");
+    assertEqual(count(C.TYPE.BATTERY, C.CONDITION.FAULTY), 1, "불량 전지 수");
+    assertEqual(count(C.TYPE.BULB, C.CONDITION.FAULTY), 1, "불량 전구 수");
+    assertEqual(wires.filter(function (w) { return w.condition === C.CONDITION.FAULTY; }).length, 1, "불량 전선 수");
+    assertEqual(s.components[C.SOCKET_ID].condition, C.CONDITION.NORMAL, "소켓 상태");
+  });
+
+  test("FR002", "새 세션 초기값: 안내 단계, 검사 0회, 연결 없음, 모두 부품 상자", function () {
+    const s = C.createSession();
+    assertEqual(s.phase, C.PHASE.INTRO, "단계");
+    assertEqual(s.inspectionCount, 0, "검사 횟수");
+    assertEqual(s.completed, false, "완료 여부");
+    assertEqual(s.inspections, [], "검사 기록");
+    assertEqual(s.components[C.SOCKET_ID].mountedBulbId, null, "소켓 장착 전구");
+    Object.keys(s.wires).forEach(function (id) {
+      assertEqual([s.wires[id].endpointA, s.wires[id].endpointB], [null, null], id + " 끝점");
+    });
+    Object.keys(s.components).forEach(function (id) {
+      assertEqual(s.components[id].position, null, id + " 위치");
+    });
+    assertEqual(Object.keys(s.terminals).sort(),
+      ["battery-A:neg", "battery-A:pos", "battery-B:neg", "battery-B:pos", "socket:1", "socket:2"], "단자 목록");
+  });
+
+  test("배정", "불량 식별자 배정: 가능한 12가지 조합이 모두 나온다", function () {
+    const batteries = idsOfType(C.TYPE.BATTERY), bulbs = idsOfType(C.TYPE.BULB), wires = idsOfType(C.TYPE.WIRE);
+    batteries.forEach(function (b, i) {
+      bulbs.forEach(function (l, j) {
+        wires.forEach(function (w, k) {
+          const picks = [i, j, k];
+          const s = C.createSession({ randomInt: function () { return picks.shift(); } });
+          assertEqual(s.components[b].condition, C.CONDITION.FAULTY, b + " 불량");
+          assertEqual(s.components[l].condition, C.CONDITION.FAULTY, l + " 불량");
+          assertEqual(s.wires[w].condition, C.CONDITION.FAULTY, w + " 불량");
+        });
+      });
+    });
+  });
+
+  test("배정", "기본 무작위 배정: 300번 만들면 모든 식별자가 한 번 이상 불량이 된다", function () {
+    const seen = {};
+    for (let n = 0; n < 300; n++) {
+      const s = C.createSession();
+      Object.keys(s.components).concat(Object.keys(s.wires)).forEach(function (id) {
+        const part = s.components[id] || s.wires[id];
+        if (part.condition === C.CONDITION.FAULTY) seen[id] = true;
+      });
+    }
+    assertEqual(Object.keys(seen).sort(), ["battery-A", "battery-B", "bulb-A", "bulb-B", "wire-1", "wire-2", "wire-3"], "불량이 된 식별자");
+  });
+
+  test("배정", "잘못된 불량 지정과 범위 밖 무작위 값은 오류로 막는다", function () {
+    assertThrows(function () { C.createSession({ faultyIds: ["battery-A", "battery-B", "wire-1"] }); }, "전지 두 개 불량");
+    assertThrows(function () { C.createSession({ faultyIds: ["battery-A", "bulb-A"] }); }, "전선 불량 없음");
+    assertThrows(function () { C.createSession({ faultyIds: ["battery-A", "bulb-A", "wire-1", "socket"] }); }, "소켓 불량");
+    assertThrows(function () { C.createSession({ randomInt: function () { return 5; } }); }, "범위 밖 무작위 값");
+  });
+
+  // ---------- 판정: 유효 폐회로 (검사 횟수 1 증가) ----------
+  test("AT13", "정상 전지·정상 전구·정상 전선 → 켜짐, 유효 검사", function () {
+    expectResult(build(basicLinks("battery-A", "wire-1", "wire-2")), ON);
+  });
+  test("AT13", "극성을 반대로(양극→단자 2, 음극→단자 1) 이어도 켜짐", function () {
+    expectResult(build([["wire-1", T("battery-A", "pos"), S2], ["wire-2", T("battery-A", "neg"), S1]]), ON);
+  });
+  test("AT13", "전선 끝점 방향(A/B)을 바꿔 연결해도 켜짐", function () {
+    expectResult(build([["wire-1", S1, T("battery-A", "pos")], ["wire-2", S2, T("battery-A", "neg")]]), ON);
+  });
+  test("AT14", "불량 전지 → 꺼짐, 유효 검사", function () {
+    expectResult(build(basicLinks("battery-B", "wire-1", "wire-2")), OFF);
+  });
+  test("AT15", "불량 전구 → 꺼짐, 유효 검사", function () {
+    expectResult(build(basicLinks("battery-A", "wire-1", "wire-2"), "bulb-B"), OFF);
+  });
+  test("AT16", "불량 전선(양극 쪽) → 꺼짐, 유효 검사", function () {
+    expectResult(build(basicLinks("battery-A", "wire-3", "wire-2")), OFF);
+  });
+  test("AT16", "불량 전선(음극 쪽) → 꺼짐, 유효 검사", function () {
+    expectResult(build(basicLinks("battery-A", "wire-1", "wire-3")), OFF);
+  });
+  test("AT17", "불량 전지 + 불량 전구 → 꺼짐, 유효 검사 한 번", function () {
+    expectResult(build(basicLinks("battery-B", "wire-1", "wire-2"), "bulb-B"), OFF);
+  });
+  test("AT17", "불량 전지 + 불량 전구 + 불량 전선 → 꺼짐, 유효 검사 한 번", function () {
+    expectResult(build(basicLinks("battery-B", "wire-3", "wire-2"), "bulb-B"), OFF);
+  });
+  test("경로 밖", "회로 밖에서 한쪽만 걸린 불량 전선은 점등에 영향 없음", function () {
+    const links = basicLinks("battery-A", "wire-1", "wire-2");
+    const s = build(links);
+    s.wires["wire-3"].endpointA = T("battery-B", "pos");
+    expectResult(s, { valid: true, reason: R.OK, lampOn: true, danglingWireIds: ["wire-3"] });
+  });
+  test("경로 밖", "회로 밖의 전지 B와 소켓에 끼우지 않은 불량 전구는 점등에 영향 없음", function () {
+    expectResult(build(basicLinks("battery-A", "wire-1", "wire-2"), "bulb-A", ["battery-B", "bulb-B", "wire-3"]), ON);
+  });
+
+  // ---------- 판정: 구성 오류 (검사 횟수 차감 없음) ----------
+  test("AT18", "전선 한쪽 끝이 열린 회로 → 개방 오류, 열린 전선 알려 줌", function () {
+    const s = build(basicLinks("battery-A", "wire-1", "wire-2"));
+    s.wires["wire-2"].endpointB = null;
+    expectResult(s, { valid: false, reason: R.OPEN, lampOn: null, danglingWireIds: ["wire-2"] });
+  });
+  test("AT18", "전선이 하나도 없는 회로 → 개방 오류", function () {
+    expectResult(build([]), { valid: false, reason: R.OPEN, lampOn: null, danglingWireIds: [] });
+  });
+  test("AT18", "전지 A 양극과 전지 B 음극을 소켓에 이은 회로 → 개방 오류", function () {
+    expectResult(build([["wire-1", T("battery-A", "pos"), S1], ["wire-2", T("battery-B", "neg"), S2]]),
+      { valid: false, reason: R.OPEN, lampOn: null });
+  });
+  test("AT18", "소켓 두 단자끼리만 이은 회로 → 개방 오류", function () {
+    expectResult(build([["wire-1", S1, S2]]), { valid: false, reason: R.OPEN, lampOn: null });
+  });
+  test("AT18", "전지 B를 거쳐 돌아가는 회로(전지 내부로는 전류가 지나가지 않음) → 개방 오류", function () {
+    expectResult(build([
+      ["wire-1", T("battery-A", "pos"), T("battery-B", "pos")],
+      ["wire-2", T("battery-B", "neg"), S1],
+      ["wire-3", T("battery-A", "neg"), S2]
+    ]), { valid: false, reason: R.OPEN, lampOn: null });
+  });
+  test("AT19", "전선은 완성됐지만 소켓이 비어 있음 → 전구 장착 안내", function () {
+    expectResult(build(basicLinks("battery-A", "wire-1", "wire-2"), null), { valid: false, reason: R.NO_BULB, lampOn: null });
+  });
+  test("AT20", "전지 양극과 음극을 전선으로 바로 이음 → 단락 경고", function () {
+    expectResult(build([["wire-1", T("battery-A", "pos"), T("battery-A", "neg")]]), { valid: false, reason: R.SHORT, lampOn: null });
+  });
+  test("AT20", "불량 전선으로 단락해도 위험한 모양이므로 단락 경고", function () {
+    expectResult(build([["wire-3", T("battery-B", "pos"), T("battery-B", "neg")]]), { valid: false, reason: R.SHORT, lampOn: null });
+  });
+  test("AT20", "회로는 완성됐지만 다른 전지를 단락함 → 단락 경고 (검사하지 않음)", function () {
+    const s = build(basicLinks("battery-A", "wire-1", "wire-2"));
+    s.wires["wire-3"].endpointA = T("battery-B", "pos");
+    s.wires["wire-3"].endpointB = T("battery-B", "neg");
+    expectResult(s, { valid: false, reason: R.SHORT, lampOn: null });
+  });
+  test("우선순위", "단락이면서 전구도 없음 → 단락 경고가 먼저", function () {
+    expectResult(build([["wire-1", T("battery-A", "pos"), T("battery-A", "neg")]], null), { valid: false, reason: R.SHORT, lampOn: null });
+  });
+  test("우선순위", "빈 보드(전선 없음, 전구 없음) → 전구 장착 안내가 먼저", function () {
+    expectResult(build([], null), { valid: false, reason: R.NO_BULB, lampOn: null });
+  });
+
+  // ---------- 전체 조합 ----------
+  test("조합", "모든 불량 배정(12) × 전지(2) × 전구(2) × 전선 쌍(6) = 288가지가 점등 규칙과 100% 일치", function () {
+    const batteries = idsOfType(C.TYPE.BATTERY), bulbs = idsOfType(C.TYPE.BULB), wires = idsOfType(C.TYPE.WIRE);
+    let checked = 0;
+    batteries.forEach(function (fb) { bulbs.forEach(function (fl) { wires.forEach(function (fw) {
+      const faulty = [fb, fl, fw];
+      batteries.forEach(function (b) { bulbs.forEach(function (l) {
+        wires.forEach(function (x) { wires.forEach(function (y) {
+          if (x === y) return;
+          const expected = faulty.indexOf(b) === -1 && faulty.indexOf(l) === -1 &&
+            faulty.indexOf(x) === -1 && faulty.indexOf(y) === -1;
+          const result = C.evaluateCircuit(build(basicLinks(b, x, y), l, faulty));
+          const label = "불량 " + faulty.join(",") + " / 사용 " + [b, l, x, y].join(",");
+          assertEqual(result.valid, true, label + " 유효");
+          assertEqual(result.lampOn, expected, label + " 점등");
+          checked++;
+        }); });
+      }); });
+    }); }); });
+    assertEqual(checked, 288, "확인한 조합 수");
+  });
+
+  // ---------- 순수 함수 성질 ----------
+  test("순수성", "판정은 입력 상태를 바꾸지 않고, 같은 입력에 같은 결과를 낸다", function () {
+    const s = build(basicLinks("battery-A", "wire-1", "wire-3"));
+    const before = JSON.stringify(s);
+    const first = C.evaluateCircuit(s);
+    const second = C.evaluateCircuit(s);
+    assertEqual(JSON.stringify(s), before, "판정 후 상태");
+    assertEqual(first, second, "두 번 판정한 결과");
+  });
+  test("순수성", "판정 결과에 어느 부품이 불량인지는 들어 있지 않다", function () {
+    const result = C.evaluateCircuit(build(basicLinks("battery-B", "wire-3", "wire-2"), "bulb-B"));
+    assertEqual(Object.keys(result).sort(), ["danglingWireIds", "lampOn", "reason", "valid"], "결과 항목");
+  });
+  test("오류 처리", "알 수 없는 단자나 전구가 아닌 장착 부품은 오류로 알린다", function () {
+    assertThrows(function () { C.evaluateCircuit(build([["wire-1", "battery-A:pos", "nowhere:1"]])); }, "알 수 없는 단자");
+    assertThrows(function () { C.evaluateCircuit(build(basicLinks("battery-A", "wire-1", "wire-2"), "battery-A")); }, "전지를 소켓에 장착");
+  });
+
+  // ---------- 실행과 표시 ----------
+  function run() {
+    const rows = document.getElementById("selftest-rows");
+    rows.textContent = "";
+    let passed = 0;
+    tests.forEach(function (t) {
+      let message = "";
+      let ok = true;
+      try { t.fn(); } catch (e) { ok = false; message = e && e.message ? e.message : String(e); }
+      if (ok) passed++;
+      const tr = document.createElement("tr");
+      [t.id, t.name, ok ? "통과" : "실패", message].forEach(function (text, i) {
+        const td = document.createElement("td");
+        td.textContent = text;
+        if (i === 2) td.className = ok ? "pass" : "fail";
+        tr.appendChild(td);
+      });
+      rows.appendChild(tr);
+    });
+    const allPassed = passed === tests.length;
+    const summary = (allPassed ? "모두 통과" : "실패 있음") + ": " + passed + " / " + tests.length + "개 통과";
+    const summaryEl = document.getElementById("selftest-summary");
+    summaryEl.textContent = summary + " (" + navigator.userAgent + ")";
+    summaryEl.className = allPassed ? "pass" : "fail";
+    document.title = "자체 검사 — " + summary;
+    if (window.console) console.log("[자체 검사] " + summary);
+  }
+
+  function route() {
+    const selftest = location.hash === "#selftest";
+    document.getElementById("app").hidden = selftest;
+    document.getElementById("selftest").hidden = !selftest;
+    if (selftest) run();
+  }
+  window.addEventListener("hashchange", route);
+  route();
+})();
+</script>
+</body>
+</html>
